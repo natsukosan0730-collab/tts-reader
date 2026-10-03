@@ -4,8 +4,13 @@ import { waitUntil } from '@vercel/functions';
 import { randomUUID } from 'node:crypto';
 import { synthesize } from '../lib/gemini.js';
 import { pcmToWav, splitText } from '../lib/audio.js';
+import { processChunks } from '../lib/runner.js';
 
 const CONCURRENCY = 2;
+// 関数の最大実行時間(300秒)に収めるため、160秒を過ぎたら新しいチャンクに着手せず次の呼び出しへ引き継ぐ
+const BUDGET_MS = 160000;
+// この時間(ms)更新が無い running ジョブは、強制終了などで止まったものとみなす
+const STALE_MS = 150000;
 const MAX_CHARS = 60000;
 // ストアはプライベート設定。保存も読み出しも pathname + access:'private' で行う
 const blobOpts = { access: 'private', addRandomSuffix: false, allowOverwrite: true };
@@ -26,44 +31,42 @@ async function readJob(id) {
   }
 }
 
-const saveJob = (job) => put(jobPath(job.id), JSON.stringify(job), { ...blobOpts, contentType: 'application/json' });
+const saveJob = (job) => {
+  job.updatedAt = Date.now();
+  return put(jobPath(job.id), JSON.stringify(job), { ...blobOpts, contentType: 'application/json' });
+};
 
-// バックグラウンドで未処理チャンクを順に音声化し、最後にWAVへ結合する
+// 自分自身(/api/jobs)を再度呼び出して、残りのチャンクの処理を新しい関数呼び出しに引き継ぐ
+async function chain(id) {
+  const host = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+  const res = await fetch(`https://${host}/api/jobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-app-password': process.env.APP_PASSWORD, 'x-chain': '1' },
+    body: JSON.stringify({ id }),
+  });
+  if (!res.ok) throw new Error(`自動継続に失敗しました(HTTP ${res.status})`);
+}
+
+// バックグラウンドで未処理チャンクを音声化し、全部終わったらWAVへ結合する
 async function runJob(job) {
   const apiKey = process.env.GEMINI_API_KEY;
   job.status = 'running';
   await saveJob(job);
-  const queue = job.chunks.filter((c) => c.status !== 'done');
-  let failed = null;
-
-  async function worker() {
-    while (queue.length && !failed) {
-      const c = queue.shift();
-      try {
-        const { pcm, usage } = await synthesize({
-          apiKey, model: job.model, voice: job.voice, style: job.style, text: c.text,
-        });
-        const blob = await put(`tts/${job.id}/${c.index}.pcm`, pcm, { ...blobOpts, contentType: 'application/octet-stream' });
-        c.status = 'done';
-        c.pcmPath = blob.pathname;
-        c.usage = usage;
-        c.bytes = pcm.length;
-      } catch (e) {
-        c.status = 'error';
-        failed = e;
-      }
-      job.tokens = job.chunks.reduce(
-        (a, x) => ({ input: a.input + (x.usage?.input || 0), output: a.output + (x.usage?.output || 0) }),
-        { input: 0, output: 0 },
-      );
-      job.doneCount = job.chunks.filter((x) => x.status === 'done').length;
-      await saveJob(job);
-    }
-  }
 
   try {
-    await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-    if (failed) throw failed;
+    const { remaining } = await processChunks(job, {
+      synth: (text) => synthesize({ apiKey, model: job.model, voice: job.voice, style: job.style, text }),
+      putPcm: async (index, pcm) =>
+        (await put(`tts/${job.id}/${index}.pcm`, pcm, { ...blobOpts, contentType: 'application/octet-stream' })).pathname,
+      save: saveJob,
+      concurrency: CONCURRENCY,
+      budgetMs: BUDGET_MS,
+    });
+    if (remaining > 0) {
+      // 時間予算を使い切った: 残りは新しい関数呼び出しに任せる(running のまま)
+      await chain(job.id);
+      return;
+    }
     const parts = [];
     for (const c of job.chunks) {
       const r = await readBlob(c.pcmPath);
@@ -102,7 +105,7 @@ export default async function handler(req, res) {
     const job = await readJob(req.query.id);
     if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
     const { audioPath, ...rest } = job;
-    return res.json({ ...rest, audioReady: !!audioPath, chunks: job.chunks.map(({ index, status }) => ({ index, status })) });
+    return res.json({ ...rest, ageMs: Date.now() - (job.updatedAt || 0), audioReady: !!audioPath, chunks: job.chunks.map(({ index, status }) => ({ index, status })) });
   }
 
   if (req.method === 'POST') {
@@ -112,7 +115,12 @@ export default async function handler(req, res) {
       // 再開: 制限時間切れなどで止まったジョブの未処理チャンクを続行
       job = await readJob(id);
       if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
-      if (job.status === 'running' || job.status === 'done') return res.json({ id: job.id });
+      if (job.status === 'done') return res.json({ id: job.id });
+      // 実行中(更新が新しい)なら二重起動しない。自動継続(x-chain)と、停止とみなせる場合は再開を許可
+      const fresh = Date.now() - (job.updatedAt || 0) < STALE_MS;
+      if ((job.status === 'running' || job.status === 'queued') && fresh && req.headers['x-chain'] !== '1') {
+        return res.json({ id: job.id });
+      }
       job.chunks.forEach((c) => { if (c.status === 'error') c.status = 'pending'; });
       job.error = null;
     } else {

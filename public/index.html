@@ -180,6 +180,7 @@ function showTokens(job) {
 }
 
 let timer = null;
+let lastAutoResume = 0;
 function stopPolling() { clearInterval(timer); timer = null; }
 function poll(id) {
   stopPolling();
@@ -199,6 +200,11 @@ function poll(id) {
         $('status').innerHTML = `<span class="err">エラー: ${job.error}</span>（「音声を生成」で続きから再開できます）`;
         $('gen').disabled = false;
         $('gen').dataset.resume = id;
+      } else if (job.ageMs > 150000 && Date.now() - lastAutoResume > 60000) {
+        // サーバー側の処理が止まっている(強制終了など)ので、続きから自動で再開する
+        lastAutoResume = Date.now();
+        $('status').textContent = `停止を検知。続きから再開します… ${job.doneCount}/${total} 分割`;
+        await api('POST', '/api/jobs', { id });
       } else {
         $('status').textContent = `生成中… ${job.doneCount}/${total} 分割`;
         $('gen').disabled = true;
