@@ -193,7 +193,7 @@ function poll(id) {
         stopPolling();
         $('status').innerHTML = '<span class="ok">完了しました</span>';
         $('gen').disabled = false;
-        await loadAudio(job.audioUrl);
+        await loadAudio(id);
       } else if (job.status === 'error') {
         stopPolling();
         $('status').innerHTML = `<span class="err">エラー: ${job.error}</span>（「音声を生成」で続きから再開できます）`;
@@ -214,8 +214,9 @@ function poll(id) {
 }
 
 let wavBlob = null;
-async function loadAudio(url) {
-  const res = await fetch(url);
+async function loadAudio(id) {
+  const res = await fetch(`/api/jobs?id=${id}&audio=1`, { headers: { 'x-app-password': $('pw').value } });
+  if (!res.ok) throw new Error('音声の取得に失敗しました');
   wavBlob = await res.blob();
   audio.src = URL.createObjectURL(wavBlob);
   $('player').hidden = false;

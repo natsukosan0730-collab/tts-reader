@@ -1,4 +1,5 @@
-import { put, head } from '@vercel/blob';
+import { put, get } from '@vercel/blob';
+import { Readable } from 'node:stream';
 import { waitUntil } from '@vercel/functions';
 import { randomUUID } from 'node:crypto';
 import { synthesize } from '../lib/gemini.js';
@@ -6,15 +7,20 @@ import { pcmToWav, splitText } from '../lib/audio.js';
 
 const CONCURRENCY = 2;
 const MAX_CHARS = 60000;
-const blobOpts = { access: 'public', addRandomSuffix: false, allowOverwrite: true };
+// ストアはプライベート設定。保存も読み出しも pathname + access:'private' で行う
+const blobOpts = { access: 'private', addRandomSuffix: false, allowOverwrite: true };
 
 const jobPath = (id) => `tts/${id}/job.json`;
 
+async function readBlob(pathname) {
+  const r = await get(pathname, { access: 'private', useCache: false });
+  return r && r.statusCode === 200 ? r : null;
+}
+
 async function readJob(id) {
   try {
-    const meta = await head(jobPath(id));
-    const res = await fetch(`${meta.url}?t=${Date.now()}`, { cache: 'no-store' });
-    return res.ok ? await res.json() : null;
+    const r = await readBlob(jobPath(id));
+    return r ? JSON.parse(await new Response(r.stream).text()) : null;
   } catch {
     return null;
   }
@@ -39,7 +45,7 @@ async function runJob(job) {
         });
         const blob = await put(`tts/${job.id}/${c.index}.pcm`, pcm, { ...blobOpts, contentType: 'application/octet-stream' });
         c.status = 'done';
-        c.pcmUrl = blob.url;
+        c.pcmPath = blob.pathname;
         c.usage = usage;
         c.bytes = pcm.length;
       } catch (e) {
@@ -60,12 +66,13 @@ async function runJob(job) {
     if (failed) throw failed;
     const parts = [];
     for (const c of job.chunks) {
-      const r = await fetch(c.pcmUrl);
-      parts.push(Buffer.from(await r.arrayBuffer()));
+      const r = await readBlob(c.pcmPath);
+      if (!r) throw new Error(`チャンク${c.index}の音声が見つかりません`);
+      parts.push(Buffer.from(await new Response(r.stream).arrayBuffer()));
     }
     const wav = pcmToWav(Buffer.concat(parts));
     const out = await put(`tts/${job.id}/final.wav`, wav, { ...blobOpts, contentType: 'audio/wav' });
-    job.audioUrl = out.url;
+    job.audioPath = out.pathname;
     job.status = 'done';
   } catch (e) {
     job.status = 'error';
@@ -82,10 +89,20 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'パスワードが違います' });
   }
 
+  if (req.method === 'GET' && req.query.audio) {
+    // 完成WAVを認証付きでストリーム配信（プライベートBlobのため直接URLでは取得できない）
+    const r = await readBlob(`tts/${req.query.id}/final.wav`);
+    if (!r) return res.status(404).json({ error: '音声が見つかりません' });
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Cache-Control', 'private, no-store');
+    return Readable.fromWeb(r.stream).pipe(res);
+  }
+
   if (req.method === 'GET') {
     const job = await readJob(req.query.id);
     if (!job) return res.status(404).json({ error: 'ジョブが見つかりません' });
-    return res.json({ ...job, chunks: job.chunks.map(({ index, status }) => ({ index, status })) });
+    const { audioPath, ...rest } = job;
+    return res.json({ ...rest, audioReady: !!audioPath, chunks: job.chunks.map(({ index, status }) => ({ index, status })) });
   }
 
   if (req.method === 'POST') {
@@ -112,7 +129,7 @@ export default async function handler(req, res) {
         chunks: pieces.map((t, index) => ({ index, text: t, status: 'pending' })),
         doneCount: 0,
         tokens: { input: 0, output: 0 },
-        audioUrl: null,
+        audioPath: null,
         error: null,
       };
     }

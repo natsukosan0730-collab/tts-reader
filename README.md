@@ -9,7 +9,7 @@ npm install
 npm test                      # 整形/分割/WAVのテスト
 npx vercel login
 npx vercel link
-npx vercel blob create-store  # Blobストア作成(BLOB_READ_WRITE_TOKEN が自動で入る)
+npx vercel blob create-store  # Blobストア作成(プライベート。BLOB_STORE_ID 等が自動で入る)
 npx vercel env add GEMINI_API_KEY      # Google AI Studioで発行したキー
 npx vercel env add APP_PASSWORD        # アプリ用の合言葉(他人の利用を防ぐ)
 npx vercel --prod
@@ -23,4 +23,5 @@ Blobストアはダッシュボードの Storage > Create > Blob からでも作
 
 ## 制約
 - 1ジョブは関数の最大実行時間(300秒)内に終わる量が目安。超えた場合はエラー表示になり、「音声を生成」で続きから再開できる。
-- 生成物はVercel Blobの公開URLに保存される(URLは推測されにくいが非公開ではない)。機密文書は入れない。
+- 生成物はプライベートなVercel Blobに保存され、アプリのパスワード付きAPI経由でのみ取得できる。
+- Blobストアは「プライベート」で作成すること(コードは access:'private' 前提)。認証はVercelが自動設定するOIDC(BLOB_STORE_ID)を使う。
