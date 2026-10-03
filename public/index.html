@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1f2937">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
+<title>TTS Reader</title>
+<style>
+  :root { --bg:#f3f4f6; --card:#fff; --text:#111827; --sub:#6b7280; --accent:#2563eb; --border:#d1d5db; --ok:#059669; --err:#dc2626; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,"Hiragino Sans","Meiryo",sans-serif; background:var(--bg); color:var(--text); padding:env(safe-area-inset-top) 12px 40px; }
+  main { max-width:720px; margin:0 auto; }
+  h1 { font-size:20px; margin:16px 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; box-shadow:0 1px 2px rgba(0,0,0,.06); }
+  label { display:block; font-size:12px; color:var(--sub); margin:8px 0 4px; }
+  textarea, input, select { width:100%; font-size:16px; padding:10px; border:1px solid var(--border); border-radius:8px; background:#fff; font-family:inherit; }
+  textarea { min-height:220px; resize:vertical; line-height:1.6; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .row > * { flex:1; min-width:120px; }
+  button { font-size:16px; padding:12px; border:0; border-radius:8px; background:var(--accent); color:#fff; font-weight:600; cursor:pointer; }
+  button.sub { background:#e5e7eb; color:var(--text); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .meta { font-size:13px; color:var(--sub); margin-top:6px; line-height:1.6; }
+  .bar { height:8px; background:#e5e7eb; border-radius:4px; overflow:hidden; margin-top:8px; }
+  .bar > div { height:100%; width:0; background:var(--accent); transition:width .3s; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+  audio { width:100%; margin-top:10px; }
+  details summary { cursor:pointer; font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎧 TTS Reader</h1>
+
+  <section class="card">
+    <label for="text">テキスト</label>
+    <textarea id="text" placeholder="ここに読み上げたい文章を貼り付け"></textarea>
+    <div class="meta" id="count">0文字</div>
+    <div class="row" style="margin-top:8px">
+      <button id="refine" class="sub">✨ 推敲する</button>
+      <button id="undo" class="sub" disabled>元に戻す</button>
+    </div>
+    <div class="meta" id="refineInfo"></div>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>設定</summary>
+      <label for="pw">アプリのパスワード</label>
+      <input id="pw" type="password" autocomplete="current-password">
+      <div class="row">
+        <div>
+          <label for="model">モデル</label>
+          <select id="model">
+            <option value="gemini-3.8-flash-tts">gemini-3.8-flash-tts</option>
+            <option value="gemini-3.8-flash-lite-tts">gemini-3.8-flash-lite-tts</option>
+            <option value="gemini-2.5-flash-preview-tts">gemini-2.5-flash-preview-tts</option>
+          </select>
+        </div>
+        <div>
+          <label for="voice">ボイス</label>
+          <select id="voice"></select>
+        </div>
+      </div>
+      <label for="style">読み上げスタイル（任意 例: 落ち着いた声でゆっくり）</label>
+      <input id="style" placeholder="空欄でもOK">
+    </details>
+  </section>
+
+  <section class="card">
+    <button id="gen" style="width:100%">🔊 音声を生成</button>
+    <div class="bar"><div id="bar"></div></div>
+    <div class="meta" id="status">待機中</div>
+    <div class="meta" id="tokens"></div>
+    <div class="meta">生成はサーバー側で続くので、画面を閉じても途中で止まりません。再度開くと続きを表示します。</div>
+  </section>
+
+  <section class="card" id="player" hidden>
+    <audio id="audio" controls preload="metadata"></audio>
+    <label for="speed">再生速度: <span id="speedVal">1.0</span>x</label>
+    <div class="row" id="speedBtns"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="dl" class="sub">⬇ WAVをダウンロード</button>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import { refineText } from './refine.js';
+
+const $ = (id) => document.getElementById(id);
+const VOICES = ['Kore','Puck','Zephyr','Charon','Fenrir','Leda','Orus','Aoede','Callirrhoe','Autonoe','Enceladus','Iapetus','Umbriel','Algieba','Despina','Erinome','Algenib','Rasalgethi','Laomedeia','Achernar','Alnilam','Schedar','Gacrux','Pulcherrima','Achird','Zubenelgenubi','Vindemiatrix','Sadachbia','Sadaltager','Sulafat'];
+// 有料換算の目安(USD / 100万トークン)。未掲載のモデルはトークン数のみ表示
+const PRICE = {
+  'gemini-3.8-flash-tts': { input: 0.5, output: 9.0 },
+  'gemini-3.8-flash-lite-tts': { input: 0.5, output: 6.0 },
+};
+const SPEEDS = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+const store = {
+  get: (k, d = '') => localStorage.getItem('tts.' + k) ?? d,
+  set: (k, v) => localStorage.setItem('tts.' + k, v),
+};
+
+// 初期化
+VOICES.forEach((v) => $('voice').add(new Option(v, v)));
+['pw', 'model', 'voice', 'style'].forEach((k) => {
+  $(k).value = store.get(k, k === 'voice' ? 'Kore' : $(k).value);
+  $(k).addEventListener('change', () => store.set(k, $(k).value));
+});
+$('text').value = store.get('text');
+let original = null;
+const updateCount = () => { $('count').textContent = `${$('text').value.length.toLocaleString()}文字`; };
+$('text').addEventListener('input', () => { store.set('text', $('text').value); updateCount(); });
+updateCount();
+
+// 推敲
+$('refine').onclick = () => {
+  const before = $('text').value;
+  if (!before.trim()) return;
+  original = before;
+  const after = refineText(before);
+  $('text').value = after;
+  store.set('text', after);
+  updateCount();
+  $('undo').disabled = false;
+  $('refineInfo').textContent = `整形しました: ${before.length.toLocaleString()}文字 → ${after.length.toLocaleString()}文字（空行・記号・URL・脚注などを整理）`;
+};
+$('undo').onclick = () => {
+  if (original == null) return;
+  $('text').value = original;
+  store.set('text', original);
+  original = null;
+  updateCount();
+  $('undo').disabled = true;
+  $('refineInfo').textContent = '元に戻しました';
+};
+
+// 再生速度
+const audio = $('audio');
+function setSpeed(s) {
+  audio.playbackRate = s;
+  audio.preservesPitch = true;
+  $('speedVal').textContent = s.toFixed(2).replace(/0$/, '');
+  store.set('speed', s);
+  [...$('speedBtns').children].forEach((b) => b.classList.toggle('sub', Number(b.dataset.s) !== s));
+}
+SPEEDS.forEach((s) => {
+  const b = document.createElement('button');
+  b.textContent = s + 'x';
+  b.dataset.s = s;
+  b.onclick = () => setSpeed(s);
+  $('speedBtns').appendChild(b);
+});
+audio.addEventListener('loadedmetadata', () => setSpeed(Number(store.get('speed', 1))));
+
+// API
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'x-app-password': $('pw').value },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+  return json;
+}
+
+function yen(usd) { return `$${usd.toFixed(4)}`; }
+function showTokens(job) {
+  const { input, output } = job.tokens;
+  let s = `トークン: 入力 ${input.toLocaleString()} / 出力 ${output.toLocaleString()}`;
+  const p = PRICE[job.model];
+  if (p) s += `（有料換算の目安 ${yen((input * p.input + output * p.output) / 1e6)}。無料枠なら $0）`;
+  else s += '（このモデルは単価未登録）';
+  $('tokens').textContent = s;
+}
+
+let timer = null;
+function stopPolling() { clearInterval(timer); timer = null; }
+function poll(id) {
+  stopPolling();
+  const tick = async () => {
+    try {
+      const job = await api('GET', `/api/jobs?id=${id}`);
+      const total = job.chunks.length;
+      $('bar').style.width = `${(job.doneCount / total) * 100}%`;
+      showTokens(job);
+      if (job.status === 'done') {
+        stopPolling();
+        $('status').innerHTML = '<span class="ok">完了しました</span>';
+        $('gen').disabled = false;
+        await loadAudio(job.audioUrl);
+      } else if (job.status === 'error') {
+        stopPolling();
+        $('status').innerHTML = `<span class="err">エラー: ${job.error}</span>（「音声を生成」で続きから再開できます）`;
+        $('gen').disabled = false;
+        $('gen').dataset.resume = id;
+      } else {
+        $('status').textContent = `生成中… ${job.doneCount}/${total} 分割`;
+        $('gen').disabled = true;
+      }
+    } catch (e) {
+      $('status').innerHTML = `<span class="err">${e.message}</span>`;
+      stopPolling();
+      $('gen').disabled = false;
+    }
+  };
+  tick();
+  timer = setInterval(tick, 3000);
+}
+
+let wavBlob = null;
+async function loadAudio(url) {
+  const res = await fetch(url);
+  wavBlob = await res.blob();
+  audio.src = URL.createObjectURL(wavBlob);
+  $('player').hidden = false;
+  if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({ title: 'TTS Reader', artist: $('model').value });
+  }
+}
+
+$('gen').onclick = async () => {
+  const resumeId = $('gen').dataset.resume;
+  try {
+    $('gen').disabled = true;
+    $('player').hidden = true;
+    $('status').textContent = '送信中…';
+    const body = resumeId
+      ? { id: resumeId }
+      : { text: $('text').value, model: $('model').value, voice: $('voice').value, style: $('style').value };
+    const { id } = await api('POST', '/api/jobs', body);
+    delete $('gen').dataset.resume;
+    store.set('jobId', id);
+    poll(id);
+  } catch (e) {
+    $('status').innerHTML = `<span class="err">${e.message}</span>`;
+    $('gen').disabled = false;
+  }
+};
+
+$('dl').onclick = () => {
+  if (!wavBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(wavBlob);
+  a.download = `tts-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.wav`;
+  a.click();
+};
+
+// 画面を開き直したら、直近のジョブの進捗/結果を復元
+const last = store.get('jobId');
+if (last && $('pw').value) poll(last);
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+</script>
+</body>
+</html>
